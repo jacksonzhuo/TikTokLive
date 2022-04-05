@@ -10,7 +10,7 @@ from dacite import from_dict
 from TikTokLive.client.http import TikTokHTTPClient
 from TikTokLive.client.proxy import ProxyContainer
 from TikTokLive.types import AlreadyConnecting, AlreadyConnected, LiveNotFound, FailedConnection, ExtendedGift
-from TikTokLive.utils import validate_and_normalize_unique_id, get_room_id_from_main_page_html
+from TikTokLive.utils import validate_and_normalize_unique_id, get_room_id_from_main_page_html, get_live_room_user_id_from_main_page_html
 
 
 class BaseClient:
@@ -63,8 +63,10 @@ class BaseClient:
         self.__unique_id: str = validate_and_normalize_unique_id(unique_id)
         self.__discard_extra_events: Optional[bool] = None
         self.__room_info: Optional[dict] = None
+        self.__rank_info: Optional[dict] = None
         self.__available_gifts: Dict[int, ExtendedGift] = dict()
         self.__room_id: Optional[str] = None
+        self.__live_room_user_id: Optional[str] = None
         self._viewer_count: Optional[int] = None
         self.__connecting: bool = False
         self.__connected: bool = False
@@ -89,7 +91,10 @@ class BaseClient:
         try:
             html: str = await self._http.get_livestream_page_html(self.__unique_id)
             self.__room_id = get_room_id_from_main_page_html(html)
+            self.__live_room_user_id = get_live_room_user_id_from_main_page_html(html)
             self._client_params["room_id"] = self.__room_id
+            #获取打赏排行榜的时候需要
+            self._client_params["anchor_id"] = self.__live_room_user_id
             return self.__room_id
         except:
             logging.error(traceback.format_exc() + "\nFailed to retrieve room id from page source")
@@ -109,6 +114,25 @@ class BaseClient:
             return self.__room_info
         except:
             logging.error(traceback.format_exc() + "\nFailed to retrieve room info from webcast api")
+            return None
+
+    async def __fetch_rank_info(self) -> Optional[dict]:
+        """
+        Fetch room rank information from Webcast API
+
+        :return: Room rank info dict
+
+        """
+
+        try:
+            #print("__fetch_rank_info")
+            response = await self._http.get_json_object_from_webcast_api("ranklist/online_audience/", self._client_params)
+            #print(response)
+            #print("__fetch_rank_info 2")
+            self.__rank_info = response
+            return self.__rank_info
+        except:
+            logging.error(traceback.format_exc() + "\nFailed to retrieve rank info from webcast api")
             return None
 
     async def __fetch_available_gifts(self) -> Optional[Dict[int, ExtendedGift]]:
@@ -299,6 +323,22 @@ class BaseClient:
         # Fetch their info & return it
         return await self.__fetch_room_info()
 
+    async def retrieve_rank_info(self) -> Optional[dict]:
+        """
+        Method to retrieve room rank information
+
+        :return: Dictionary containing all room rank info
+
+        """
+
+        # If not connected yet, get their room id
+        if not self.__connected:
+            #await self.__fetch_room_id()
+            return None
+
+        # Fetch their info & return it
+        return await self.__fetch_rank_info()
+
     async def retrieve_available_gifts(self) -> Optional[Dict[int, ExtendedGift]]:
         """
         Retrieve available gifts from Webcast API
@@ -375,6 +415,16 @@ class BaseClient:
         return self.__room_id
 
     @property
+    def live_room_user_id(self) -> Optional[int]:
+        """
+        Live room user ID if the connection was successful
+
+        :return: live room user's ID
+
+        """
+        return self.__live_room_user_id
+
+    @property
     def room_info(self) -> Optional[dict]:
         """
         Room info dict if the connection was successful
@@ -384,6 +434,17 @@ class BaseClient:
         """
 
         return self.__room_info
+
+    @property
+    def rank_info(self) -> Optional[dict]:
+        """
+        Room rank info dict if the connection was successful
+
+        :return: Room Rank Info Dict
+
+        """
+
+        return self.__rank_info
 
     @property
     def unique_id(self) -> str:

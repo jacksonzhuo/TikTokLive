@@ -77,6 +77,7 @@ class TikTokHTTPClient:
         """
 
         request_url: str = f"{url}?{urllib.parse.urlencode(params if params is not None else dict())}"
+        print(request_url)
         async with self.session.get(request_url, headers=self.headers, timeout=self.timeout, proxy=self.proxy_container.get()) as request:
             return await request.json()
 
@@ -118,6 +119,6 @@ class TikTokHTTPClient:
         :raises: asyncio.TimeoutError
 
         """
-
         response: dict = await self.__aiohttp_get_json(self.TIKTOK_URL_WEBCAST + path, params)
+        #print(response)
         return response.get("data")
