@@ -19,6 +19,23 @@ def get_room_id_from_main_page_html(main_page_html: str) -> str:
     valid_response: bool = '"og:url"' in main_page_html
     raise Exception("User might be offline" if valid_response else "Your IP or country might be blocked by TikTok.")
 
+def get_live_room_user_id_from_main_page_html(main_page_html: str) -> str:
+    """
+    Get the room ID from the HTML of the creator's page.
+    If this fails, you are probably blocked from TikTok. Use a VPN.
+
+    :return: Their room ID
+
+    """
+    
+    try:
+        return main_page_html.split('"liveRoomUserInfo":{"user":{"id":"')[1].split('",')[0]
+    except:
+        pass
+
+    valid_response: bool = '"og:url"' in main_page_html
+    raise Exception("User might be offline" if valid_response else "Your IP or country might be blocked by TikTok.")
+
 
 def validate_and_normalize_unique_id(unique_id: str) -> str:
     """
