@@ -200,6 +200,20 @@ class GiftDetails(AbstractObject):
 
 
 @dataclass()
+class GiftExtra:
+    """
+    Gift object containing information about the gift recipient
+
+    """
+
+    timestamp: Optional[int]
+    """The time the gift was sent"""
+
+    receiverUserId: Optional[int]
+    """The user that received the gift"""
+
+
+@dataclass()
 class Gift(AbstractObject):
     """
     Gift object containing information about a given gift
@@ -216,7 +230,10 @@ class Gift(AbstractObject):
     """Whether or not the repetition is over"""
 
     giftDetails: Optional[GiftDetails]
-    """Additional details about the gift"""
+    """Details about the specific Gift sent"""
+
+    giftExtra: Optional[GiftExtra]
+    """Details like who the gift was sent to (multi-user streams)"""
 
     extended_gift: Optional[ExtendedGift]
     """Extended gift including extra data (not very important as of april 2022)"""
