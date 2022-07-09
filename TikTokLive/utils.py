@@ -40,8 +40,9 @@ def get_live_room_user_id_from_main_page_html(main_page_html: str) -> str:
         pass
 
     try:
-        c = r'{' + re.search(r'"liveRoomUserInfo":{(.*)}', main_page_html).group(0)
-        return json.loads(c)['liveRoomUserInfo']['user']['id']
+        c = re.search(r'"liveRoomUserInfo":{"user":(.*?)}', main_page_html).group(0)
+        c = "{" + c.replace('"liveRoomUserInfo":{', "") + "}"
+        return json.loads(c)['user']['id']
     except:
         pass
 
