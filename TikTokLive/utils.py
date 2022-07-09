@@ -39,6 +39,12 @@ def get_live_room_user_id_from_main_page_html(main_page_html: str) -> str:
     except:
         pass
 
+    try:
+        c = r'{' + re.search(r'"liveRoomUserInfo":{(.*)}', main_page_html).group(0)
+        return json.loads(c)['liveRoomUserInfo']['user']['id']
+    except:
+        pass
+
     valid_response: bool = '"og:url"' in main_page_html
     raise Exception("User might be offline" if valid_response else "Your IP or country might be blocked by TikTok.")
 

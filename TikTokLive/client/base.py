@@ -74,6 +74,8 @@ class BaseClient:
         self.__connected: bool = False
         self.__session_id: Optional[str] = None
 
+        self.__live_html: Optional[str] = None
+
         # Change Language
         TikTokHTTPClient.DEFAULT_CLIENT_PARAMS["app_language"] = lang
         TikTokHTTPClient.DEFAULT_CLIENT_PARAMS["webcast_language"] = lang
@@ -97,6 +99,7 @@ class BaseClient:
 
         try:
             html: str = await self._http.get_livestream_page_html(self.__unique_id)
+            self.__live_html = html
             self.__room_id = get_room_id_from_main_page_html(html)
             self.__live_room_user_id = get_live_room_user_id_from_main_page_html(html)
             self._client_params["room_id"] = self.__room_id
@@ -220,10 +223,10 @@ class BaseClient:
         """
 
         if self.__connecting:
-            raise AlreadyConnecting()
+            raise AlreadyConnecting("live is connecting")
 
         if self.__connected:
-            raise AlreadyConnected()
+            raise AlreadyConnected("live is already connected")
 
         self.__connecting = True
 
@@ -236,7 +239,7 @@ class BaseClient:
 
                 # If offline
                 if self.__room_info.get("status", 4) == 4:
-                    raise LiveNotFound()
+                    raise LiveNotFound("live not found")
 
             # Get extended gift info
             if self._enable_extended_gift_info:
@@ -485,6 +488,17 @@ class BaseClient:
         """
 
         return self.__room_info
+
+    @property
+    def live_html(self) -> Optional[dict]:
+        """
+        Room info dict if the connection was successful
+
+        :return: Room Info Dict
+
+        """
+
+        return self.__live_html or ""
 
     @property
     def rank_info(self) -> Optional[dict]:

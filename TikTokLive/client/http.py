@@ -2,6 +2,7 @@ import urllib.parse
 from typing import Dict, Union, Optional
 
 from aiohttp import ClientSession
+from aiohttp import TCPConnector
 
 from TikTokLive.client.proxy import ProxyContainer
 from TikTokLive.proto.utilities import deserialize_message
@@ -63,7 +64,7 @@ class TikTokHTTPClient:
         """
         request_url: str = f"{url}?{urllib.parse.urlencode(params if params is not None else dict())}"
 
-        async with ClientSession() as session:
+        async with ClientSession(connector=TCPConnector(verify_ssl=False)) as session:
             async with session.get(request_url, headers=self.headers, timeout=self.timeout, proxy=self.proxy_container.get()) as request:
                 return await request.read()
 
@@ -80,7 +81,9 @@ class TikTokHTTPClient:
 
         request_url: str = f"{url}?{urllib.parse.urlencode(params if params is not None else dict())}"
 
-        async with ClientSession() as session:
+        #print(request_url)
+
+        async with ClientSession(connector=TCPConnector(verify_ssl=False)) as session:
             async with session.get(request_url, headers=self.headers, timeout=self.timeout, proxy=self.proxy_container.get()) as request:
                 return await request.json()
 
@@ -98,7 +101,7 @@ class TikTokHTTPClient:
         """
         request_url: str = f"{url}?{urllib.parse.urlencode(params if params is not None else dict())}"
 
-        async with ClientSession(cookies=self.cookies) as session:
+        async with ClientSession(cookies=self.cookies,connector=TCPConnector(verify_ssl=False)) as session:
             async with session.post(request_url, data=json, headers=self.headers, timeout=self.timeout, proxy=self.proxy_container.get()) as request:
                 return await request.json()
 
@@ -112,6 +115,7 @@ class TikTokHTTPClient:
 
         """
 
+        #print(f"{TikTokHTTPClient.TIKTOK_URL_WEB}@{unique_id}/live")
         response: bytes = await self.__aiohttp_get_bytes(f"{TikTokHTTPClient.TIKTOK_URL_WEB}@{unique_id}/live")
         return response.decode(encoding="utf-8")
 
@@ -140,7 +144,8 @@ class TikTokHTTPClient:
         :raises: asyncio.TimeoutError
 
         """
-
+        #print(self.TIKTOK_URL_WEBCAST + path)
+        #print(params)
         response: dict = await self.__aiohttp_get_json(self.TIKTOK_URL_WEBCAST + path, params)
         return response.get("data")
 
