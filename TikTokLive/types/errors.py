@@ -30,6 +30,14 @@ class FailedConnection(RuntimeError):
     pass
 
 
+class InitialCursorMissing(FailedConnection):
+    """
+    Error that is raised when the initial cursor is missing
+
+    """
+    pass
+
+
 class InvalidSessionId(RuntimeError):
     """
     Error raised when a session ID is expired or missing
@@ -55,3 +63,93 @@ class ChatMessageRepeat(ChatMessageSendFailure):
     """
 
     pass
+
+
+class WebsocketConnectionFailed(RuntimeError):
+    """
+    Raised when a connection to the TikTok Webcast websocket fails
+
+    """
+
+    pass
+
+
+class FailedHTTPRequest(RuntimeError):
+    """
+    Error raised whenever a request fails to HTTP [Generic]
+
+    """
+
+
+class FailedFetchRoomInfo(FailedHTTPRequest):
+    """
+    Error raised when failing to fetch room info
+
+    """
+
+
+class FailedParseUserHTML(FailedFetchRoomInfo):
+    """
+    Error raised when failing to parse room html to retrieve the Room ID of the stream
+
+    """
+
+
+class FailedRoomPolling(FailedHTTPRequest):
+    """
+    Error raised when room polling encounters an exception
+
+    """
+
+    pass
+
+
+class FailedFetchGifts(FailedHTTPRequest):
+    """
+    Error raised when fetching gifts encounters an exception
+
+    """
+
+
+class DownloadStreamError(RuntimeError):
+    """
+    Error raised broadly for anything relating to downloading streams
+
+    """
+
+    pass
+
+
+class AlreadyDownloadingStream(DownloadStreamError):
+    """
+    Error raised when already downloading a livestream and one attempts to start a second download
+
+    """
+
+
+class NotDownloadingStream(DownloadStreamError):
+    """
+    Error raised when trying to stop downloading a livestream you are not currently downloading
+
+    """
+
+
+class DownloadProcessNotFound(DownloadStreamError):
+    """
+    Error raised when stopping a download and the process is not found. Usually, you're stopping it before the process spawns
+
+    """
+
+
+class SignatureRateLimitReached(FailedHTTPRequest):
+    """
+    When a user hits the signature rate limit
+
+    """
+
+
+class SignatureSigningError(FailedHTTPRequest):
+    """
+    When the sign server fails to return a valid payload
+
+    """

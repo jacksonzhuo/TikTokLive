@@ -1,19 +1,34 @@
 import asyncio
 import logging
+import os
+import signal
 import sys
 import traceback
+import json
 from asyncio import AbstractEventLoop
-from typing import Optional, List, Dict
+from datetime import datetime
+from threading import Thread
+from typing import Optional, List, Dict, Set
 
 from dacite import from_dict
+from ffmpy import FFmpeg, FFRuntimeError
+from pyee import AsyncIOEventEmitter
+from tornado.httpclient import HTTPRequest
+from tornado.websocket import WebSocketClientConnection, websocket_connect, WebSocketClosedError
 
-from TikTokLive.client.http import TikTokHTTPClient
-from TikTokLive.client.proxy import ProxyContainer
-from TikTokLive.types import AlreadyConnecting, AlreadyConnected, LiveNotFound, FailedConnection, ExtendedGift, InvalidSessionId, ChatMessageSendFailure, ChatMessageRepeat
+from TikTokLive.client import config
+from TikTokLive.client.httpx import TikTokHTTPClient
+from TikTokLive.proto.tiktok_schema_pb2 import WebcastWebsocketAck
+from TikTokLive.proto.utilities import deserialize_websocket_message, serialize_message
+from TikTokLive.types import AlreadyConnecting, AlreadyConnected, LiveNotFound, FailedConnection, ExtendedGift, \
+    InvalidSessionId, ChatMessageSendFailure, ChatMessageRepeat, FailedFetchRoomInfo, FailedFetchGifts, \
+    FailedRoomPolling, FFmpegWrapper, AlreadyDownloadingStream, DownloadProcessNotFound, NotDownloadingStream, \
+    InitialCursorMissing, VideoQuality
 from TikTokLive.utils import validate_and_normalize_unique_id, get_room_id_from_main_page_html, get_live_room_user_id_from_main_page_html
 
 
-class BaseClient:
+
+class BaseClient(AsyncIOEventEmitter):
     """
     Base client responsible for long polling to the TikTok Webcast API
 
@@ -26,13 +41,15 @@ class BaseClient:
             client_params: Optional[dict] = None,
             headers: Optional[dict] = None,
             timeout_ms: Optional[int] = None,
-            polling_interval_ms: int = 1000,
+            ping_interval_ms: int = 1000,
             process_initial_data: bool = True,
-            fetch_room_info_on_connect: bool = True,
             enable_extended_gift_info: bool = True,
             trust_env: bool = False,
-            proxy_container: Optional[ProxyContainer] = None,
-            lang: Optional[str] = "en-US"
+            proxies: Optional[Dict[str, str]] = None,
+            lang: Optional[str] = "en-US",
+            fetch_room_info_on_connect: bool = True,
+            websocket_enabled: bool = True,
+            sign_api_key: Optional[str] = None
     ):
         """
         Initialize the base client
@@ -42,24 +59,26 @@ class BaseClient:
         :param client_params: Additional client parameters to include when making requests to the Webcast API
         :param headers: Additional headers to include when making requests to the Webcast API
         :param timeout_ms: The timeout (in ms) for requests made to the Webcast API
-        :param polling_interval_ms: The interval between requests made to the Webcast API
+        :param ping_interval_ms: The interval between requests made to the Webcast API for both Websockets and Long Polling
         :param process_initial_data: Whether to process the initial data (including cached chats)
-        :param fetch_room_info_on_connect: Whether to fetch room info (check if everything is kosher) on connect
         :param enable_extended_gift_info: Whether to retrieve extended gift info including its icon & other important things
         :param trust_env: Whether to trust environment variables that provide proxies to be used in aiohttp requests
-        :param proxy_container: A proxy container that allows you to submit an unlimited # of proxies for rotation
+        :param proxies: Enable proxied requests by turning on forwarding for the HTTPX "proxies" argument. Websocket connections will NOT be proxied
         :param lang: Change the language. Payloads *will* be in English, but this will change stuff like the extended_gift Gift attribute to the desired language!
-
+        :param fetch_room_info_on_connect: Whether to fetch room info on connect. If disabled, you might attempt to connect to a closed livestream
+        :param websocket_enabled: Whether to use websockets or rely on purely long polling
+        :param sign_api_key: Parameter to increase the amount of connections allowed to be made per minute via a Sign Server API key. If you need this, contact the project maintainer.
         """
+        AsyncIOEventEmitter.__init__(self)
 
         # Get Event Loop
         if isinstance(loop, AbstractEventLoop):
             self.loop: AbstractEventLoop = loop
         else:
             try:
-                self.loop: AbstractEventLoop = asyncio.get_event_loop()
-            except RuntimeError:
                 self.loop: AbstractEventLoop = asyncio.get_running_loop()
+            except RuntimeError:
+                self.loop: AbstractEventLoop = asyncio.new_event_loop()
 
         # Private Attributes
         self.__unique_id: str = validate_and_normalize_unique_id(unique_id)
@@ -73,20 +92,43 @@ class BaseClient:
         self.__connecting: bool = False
         self.__connected: bool = False
         self.__session_id: Optional[str] = None
-
+        self.__is_ws_upgrade_done: bool = False
+        self.__websocket_enabled: bool = websocket_enabled
         self.__live_html: Optional[str] = None
 
         # Change Language
-        TikTokHTTPClient.DEFAULT_CLIENT_PARAMS["app_language"] = lang
-        TikTokHTTPClient.DEFAULT_CLIENT_PARAMS["webcast_language"] = lang
+        config.DEFAULT_CLIENT_PARAMS["app_language"] = lang
+        config.DEFAULT_CLIENT_PARAMS["webcast_language"] = lang
 
         # Protected Attributes
-        self._client_params: dict = {**TikTokHTTPClient.DEFAULT_CLIENT_PARAMS, **(client_params if isinstance(client_params, dict) else dict())}
-        self._http: TikTokHTTPClient = TikTokHTTPClient(headers if headers is not None else dict(), timeout_ms=timeout_ms, proxy_container=proxy_container, trust_env=trust_env)
-        self._polling_interval_ms: int = polling_interval_ms
+        self._http: TikTokHTTPClient = TikTokHTTPClient(
+            headers=headers if headers is not None else dict(),
+            timeout_ms=timeout_ms,
+            proxies=proxies,
+            trust_env=trust_env,
+            params={**config.DEFAULT_CLIENT_PARAMS, **(client_params if isinstance(client_params, dict) else dict())},
+            sign_api_key=sign_api_key
+        )
+        self._ping_interval_ms: int = ping_interval_ms
         self._process_initial_data: bool = process_initial_data
-        self._fetch_room_info_on_connect: bool = fetch_room_info_on_connect
         self._enable_extended_gift_info: bool = enable_extended_gift_info
+        self._fetch_room_info_on_connect: bool = fetch_room_info_on_connect
+        self._download: Optional[FFmpegWrapper] = None
+
+        # Listeners
+        self.add_listener("websocket", self._handle_webcast_messages)
+
+    async def _on_error(self, original: Exception, append: Optional[Exception]) -> None:
+        """
+        Send errors to the _on_error handler for handling, appends a custom exception
+
+        :param original: The original Python exception
+        :param append: The specific exception
+        :return: None
+
+        """
+
+        raise NotImplementedError()
 
     async def __fetch_room_id(self) -> Optional[str]:
         """
@@ -102,11 +144,12 @@ class BaseClient:
             self.__live_html = html
             self.__room_id = get_room_id_from_main_page_html(html)
             self.__live_room_user_id = get_live_room_user_id_from_main_page_html(html)
-            self._client_params["room_id"] = self.__room_id
-            self._client_params["anchor_id"] = self.__live_room_user_id
+            print("live room user id:" + self.__live_room_user_id)
+            self._http.params["room_id"] = self.__room_id
+            self._http.params["anchor_id"] = self.__live_room_user_id
             return self.__room_id
-        except:
-            logging.error(traceback.format_exc() + "\nFailed to retrieve room id from page source")
+        except Exception as ex:
+            await self._on_error(ex, FailedFetchRoomInfo("Failed to fetch room id from Webcast, see stacktrace for more info."))
             return None
 
     async def __fetch_room_info(self) -> Optional[dict]:
@@ -118,11 +161,11 @@ class BaseClient:
         """
 
         try:
-            response = await self._http.get_json_object_from_webcast_api("room/info/", self._client_params)
+            response = await self._http.get_json_object_from_webcast_api("room/info/", self._http.params)
             self.__room_info = response
             return self.__room_info
-        except:
-            logging.error(traceback.format_exc() + "\nFailed to retrieve room info from webcast api")
+        except Exception as ex:
+            await self._on_error(ex, FailedFetchRoomInfo("Failed to fetch room info from Webcast, see stacktrace for more info."))
             return None
 
     async def __fetch_rank_info(self) -> Optional[dict]:
@@ -135,7 +178,7 @@ class BaseClient:
 
         try:
             #print("__fetch_rank_info")
-            response = await self._http.get_json_object_from_webcast_api("ranklist/online_audience/", self._client_params)
+            response = await self._http.get_json_object_from_webcast_api("ranklist/online_audience/", self._http.params)
             #print(response)
             #print("__fetch_rank_info 2")
             self.__rank_info = response
@@ -153,7 +196,7 @@ class BaseClient:
         """
 
         try:
-            response = await self._http.get_json_object_from_webcast_api("gift/list/", self._client_params)
+            response = await self._http.get_json_object_from_webcast_api("gift/list/", self._http.params)
             gifts: Optional[List] = response.get("gifts")
 
             if isinstance(gifts, list):
@@ -165,8 +208,8 @@ class BaseClient:
                         logging.error(traceback.format_exc() + "\nFailed to parse gift's extra info")
 
             return self.__available_gifts
-        except:
-            logging.error(traceback.format_exc() + "\nFailed to retrieve gifts from webcast api")
+        except Exception as ex:
+            await self._on_error(ex, FailedFetchGifts("Failed to fetch gift data from Webcast, see stacktrace for more info."))
             return None
 
     async def __fetch_room_polling(self) -> None:
@@ -178,13 +221,13 @@ class BaseClient:
         """
 
         self.__is_polling_enabled = True
-        polling_interval: int = int(self._polling_interval_ms / 1000)
+        polling_interval: float = self._ping_interval_ms / 1000
 
         while self.__is_polling_enabled:
             try:
                 await self.__fetch_room_data()
-            except:
-                logging.error(traceback.format_exc() + "\nError while fetching room data")
+            except Exception as ex:
+                await self._on_error(ex, FailedRoomPolling("Failed to retrieve events from Webcast, see stacktrace for more info."))
 
             await asyncio.sleep(polling_interval)
 
@@ -197,14 +240,137 @@ class BaseClient:
 
         """
 
-        webcast_response = await self._http.get_deserialized_object_from_webcast_api("im/fetch/", self._client_params, "WebcastResponse")
-        _last_cursor, _next_cursor = self._client_params["cursor"], webcast_response.get("cursor")
-        self._client_params["cursor"] = _last_cursor if _next_cursor == "0" else _next_cursor
+        # Fetch from polling api
+        webcast_response = await self._http.get_deserialized_object_from_webcast_api("im/fetch/", self._http.params, "WebcastResponse", is_initial)
+        _last_cursor, _next_cursor = self._http.params["cursor"], webcast_response.get("cursor")
+        self._http.params["cursor"] = _last_cursor if _next_cursor == "0" else _next_cursor
 
-        if is_initial and not self._process_initial_data:
-            return
+        # Add param if given
+        if webcast_response.get("internalExt"):
+            self._http.params["internal_ext"] = webcast_response["internalExt"]
+
+        if is_initial:
+            if not webcast_response.get("cursor"):
+                raise InitialCursorMissing("Missing cursor in initial fetch response.")
+
+            # If a WebSocket is offered, upgrade
+            if bool(webcast_response.get("wsUrl")) and bool(webcast_response.get("wsParam")) and self.__websocket_enabled:
+                await self.__try_websocket_upgrade(webcast_response)
+
+            # Process initial data if requested
+            if not self._process_initial_data:
+                return
 
         await self._handle_webcast_messages(webcast_response)
+
+    async def __try_websocket_upgrade(self, webcast_response) -> None:
+        """
+        Attempt to upgrade the connection to a websocket instead
+
+        :param webcast_response: The initial webcast response including the wsParam and wsUrl items
+        :return: The websocket, if one is produced
+
+        """
+
+        uri: str = self._http.update_url(
+            webcast_response.get("wsUrl"),
+            {**self._http.params, **{"imprp": webcast_response.get("wsParam").get("value")}}
+        )
+
+        print(" ".join(f"{k}={v};" for k, v in self._http.client.cookies.items()))
+
+        headers: dict = {
+            "Cookie": " ".join(f"{k}={v};" for k, v in self._http.client.cookies.items())
+        }
+
+        try:
+            print("web url:" + uri)
+            connection: WebSocketClientConnection = await websocket_connect(
+                ping_interval=None,
+                ping_timeout=15,
+                subprotocols=["echo-protocol"],
+                url=HTTPRequest(
+                    url=uri,
+                    headers=headers
+                )
+            )
+        except:
+            logging.error(traceback.format_exc())
+            return
+
+        self.__is_ws_upgrade_done, self.__connected = True, True
+        self.loop.create_task(self.__ws_connection_loop(connection))
+        self.loop.create_task(self.__send_pings(connection))
+
+    async def __ws_connection_loop(self, connection: WebSocketClientConnection) -> None:
+        """
+        Websocket connection loop responsible for polling the websocket connection at regular intervals
+
+        :param connection: Websocket connection object
+        :return: None
+
+        """
+
+        while self.__connected:
+            response = await connection.read_message()
+
+            # If None, socket is closed
+            if response is None:
+                self._disconnect(webcast_closed=True)
+                return
+
+            # Deserialize
+            decoded: dict = deserialize_websocket_message(response)
+
+            # Send acknowledgement
+            if decoded.get("id", None):
+                try:
+                    await self.__send_ack(decoded["id"], connection)
+                except WebSocketClosedError:
+                    self._disconnect(webcast_closed=True)
+
+            # Parse received message
+            if decoded.get("messages"):
+                await self._handle_webcast_messages(decoded)
+
+    async def __send_pings(self, connection: WebSocketClientConnection) -> None:
+        """
+        Send KeepAlive ping to Websocket every 10 seconds... like clockwork!
+
+        :param connection: Websocket connection object
+        :return: None
+
+        """
+
+        ping: bytes = bytes.fromhex("3A026862")
+
+        while self.__connected:
+            try:
+                await connection.write_message(ping, binary=True)
+            except WebSocketClosedError:
+                self._disconnect(webcast_closed=True)
+
+            await asyncio.sleep(10)
+
+    @classmethod
+    async def __send_ack(cls, message_id: int, connection: WebSocketClientConnection) -> None:
+        """
+        Send an acknowledgement to the server that the message was received
+
+        :param message_id: The message id to be acknowledged
+        :param connection: The websocket connection
+        :return: None
+
+        """
+        message: WebcastWebsocketAck = serialize_message(
+            "WebcastWebsocketAck",
+            {
+                "type": "ack",
+                "id": message_id
+            }
+        )
+
+        await connection.write_message(message, binary=True)
 
     async def _handle_webcast_messages(self, webcast_response) -> None:
         """
@@ -214,13 +380,14 @@ class BaseClient:
 
         raise NotImplementedError
 
-    async def _connect(self) -> str:
+    async def _connect(self, session_id: str = None) -> str:
         """
-        Connect to the Websocket API
+        Connect to the WebcastWebsocket API
 
         :return: The room ID, if connection is successful
 
         """
+        self.__set_session_id(session_id)
 
         if self.__connecting:
             raise AlreadyConnecting("live is connecting")
@@ -239,7 +406,7 @@ class BaseClient:
 
                 # If offline
                 if self.__room_info.get("status", 4) == 4:
-                    raise LiveNotFound("live not found")
+                    raise LiveNotFound("The requested user is most likely offline.")
 
             # Get extended gift info
             if self._enable_extended_gift_info:
@@ -249,8 +416,19 @@ class BaseClient:
             await self.__fetch_room_data(True)
             self.__connected = True
 
-            # Use request polling (Websockets not implemented)
-            self.loop.create_task(self.__fetch_room_polling())
+            # If the websocket was not connected for whatever reason
+            if not self.__is_ws_upgrade_done:
+                # Switch to long polling if a session id was provided
+                if self._http.client.cookies.get("sessionid"):
+                    self.loop.create_task(self.__fetch_room_polling())
+
+                else:
+                    # No more options, fail to connect
+                    raise FailedRoomPolling(
+                        ("You have disabled websockets, but not included a sessionid for long polling. " if not self.__websocket_enabled else "")
+                        + "Long polling is not available: Try adding a sessionid as an argument in start() or run()"
+                    )
+
             return self.__room_id
 
         except Exception as ex:
@@ -267,9 +445,9 @@ class BaseClient:
                 message = str(ex)
 
             self.__connecting = False
-            raise FailedConnection(message)
+            await self._on_error(ex, FailedConnection(message))
 
-    def _disconnect(self) -> None:
+    def _disconnect(self, webcast_closed: bool = False) -> None:
         """
         Set unconnected status
 
@@ -281,11 +459,14 @@ class BaseClient:
         self.__room_info: Optional[dict] = None
         self.__connecting: Optional[bool] = False
         self.__connected: Optional[bool] = False
-        self._client_params["cursor"]: str = ""
+        self._http.params["cursor"]: str = ""
 
-    async def stop(self) -> None:
+        if webcast_closed:
+            logging.error("Connection was lost to the Webcast Websocket Server. Restart the client connection to continue.")
+
+    def stop(self) -> None:
         """
-        Stop the client
+        Stop the client safely
 
         :return: None
 
@@ -303,9 +484,7 @@ class BaseClient:
 
         """
 
-        self.__set_session_id(session_id)
-
-        return await self._connect()
+        return await self._connect(session_id=session_id)
 
     def run(self, session_id: Optional[str] = None) -> None:
         """
@@ -314,9 +493,8 @@ class BaseClient:
         :return: None
 
         """
-        self.__set_session_id(session_id)
 
-        self.loop.run_until_complete(self._connect())
+        self.loop.run_until_complete(self._connect(session_id=session_id))
         self.loop.run_forever()
 
     def __set_session_id(self, session_id: Optional[str]) -> None:
@@ -330,7 +508,7 @@ class BaseClient:
 
         if session_id:
             self.__session_id = session_id
-            self._http.cookies["sessionid"] = session_id
+            self._http.client.cookies.set("sessionid", session_id)
 
     async def send_message(self, text: str, session_id: Optional[str] = None) -> Optional[str]:
         """
@@ -338,7 +516,7 @@ class BaseClient:
 
         :param text: The message you want to send to the chat
         :param session_id: The Session ID (If you've already supplied one, you don't need to)
-        :return: None
+        :return: The response from the webcast API
 
         """
 
@@ -347,20 +525,23 @@ class BaseClient:
         if not self.__session_id:
             raise InvalidSessionId("Missing Session ID. Please provide your current Session ID to use this feature.")
 
-        params: dict = {**self._client_params, "content": text}
-        response: dict = await self._http.post_json_to_webcast_api("room/chat/", params, None)
+        params: dict = {**self._http.params, "content": text}
+        response: dict = await self._http.post_json_to_webcast_api("room/chat/", params, None, sign_url=False)
         status_code: Optional[int] = response.get("status_code")
         data: Optional[dict] = response.get("data")
 
         if status_code == 0:
             return data
 
-        raise {
-            20003: InvalidSessionId("Your Session ID has expired. Please provide a new one"),
-            50007: ChatMessageRepeat("You cannot send repeated chat messages!")
-        }.get(
-            status_code, ChatMessageSendFailure(f"TikTok responded with status code {status_code}: {data.get('message')}")
-        )
+        try:
+            raise {
+                20003: InvalidSessionId("Your Session ID has expired. Please provide a new one"),
+                50007: ChatMessageRepeat("You cannot send repeated chat messages!")
+            }.get(
+                status_code, ChatMessageSendFailure(f"TikTok responded with status code {status_code}: {data.get('message')}")
+            )
+        except Exception as ex:
+            await self._on_error(ex, None)
 
     async def retrieve_room_info(self) -> Optional[dict]:
         """
@@ -403,50 +584,130 @@ class BaseClient:
 
         return await self.__fetch_available_gifts()
 
-    async def set_proxies_enabled(self, enabled: bool) -> None:
+    def download(
+            self,
+            path: str,
+            duration: Optional[int] = None,
+            quality: Optional[VideoQuality] = None,
+            verbose: bool = True,
+            loglevel: str = "error",
+            global_options: Set[str] = set(),
+            inputs: Dict[str, str] = dict(),
+            outputs: Dict[str, str] = dict()
+    ) -> None:
         """
-        Set whether to use proxies in requests
+        Start downloading the user's livestream video for a given duration, NON-BLOCKING via Python Threading
 
-        :param enabled: Whether proxies are enabled or not
+        :param loglevel: Set the FFmpeg log level
+        :param outputs: Pass custom params to FFmpeg outputs
+        :param inputs: Pass custom params to FFmpeg inputs
+        :param global_options: Pass custom params to FFmpeg global options
+        :param path: The path to download the livestream video to
+        :param duration: If duration is None or less than 1, download will go forever
+        :param quality: If quality is None, download quality will auto
+        :param verbose: Whether to log info about the download in console
+
         :return: None
+        :raises: AlreadyDownloadingStream if already downloading and attempting to start a second download
 
         """
 
-        self._http.proxy_container.set_enabled(enabled)
+        # If already downloading stream at the moment
+        if self._download is not None:
+            raise AlreadyDownloadingStream()
 
-    async def add_proxies(self, *proxies: str) -> None:
-        """
-        Add proxies to the proxy container for request usage
+        # Set a runtime
+        runtime: Optional[str] = None
+        if duration is not None and duration >= 1:
+            runtime = f"-t {duration}"
         
-        :param proxies: Proxies for usage
+        # Set a quality
+        url: dict = json.loads(self.room_info['stream_url']['live_core_sdk_data']['pull_data']['stream_data'])
+        quality = quality if isinstance(quality, VideoQuality) else VideoQuality.ORIGIN
+
+        # Set the URL based on selected quality
+        url_param: str = url['data'][quality.value]['main']['hls']
+
+        # Function Running
+        def spool():
+            try:
+                self._download.ffmpeg.run()
+            except FFRuntimeError as ex:
+                if ex.exit_code and ex.exit_code != 255:
+                    self._download = None
+                    raise
+            self._download = None
+
+        # Create an FFmpeg wrapper
+        self._download = FFmpegWrapper(
+            ffmpeg=FFmpeg(
+                inputs={**{url_param: None}, **inputs},
+                outputs={**{path: runtime}, **outputs},
+                global_options={"-y", f"-loglevel {loglevel}"}.union(global_options)
+            ),
+            thread=Thread(target=spool),
+            verbose=verbose,
+            path=path,
+            runtime=runtime
+        )
+
+        # Start the download
+        self._download.thread.start()
+        self._download.started_at = int(datetime.utcnow().timestamp())
+
+        # Give info about the started download
+        if self._download.verbose:
+            logging.warning(f"Started the download to path \"{path}\" for duration \"{'infinite' if runtime is None else duration} seconds\" on user @{self.unique_id} with \"{quality.name}\" video quality")
+
+    def stop_download(self) -> None:
+        """
+        Stop downloading a livestream if currently downloading
+
         :return: None
-        
+        :raises NotDownloadingStream: Raised if trying to stop when not downloading and
+        :raises DownloadProcessNotFound: Raised if stopping before the ffmpeg process has opened
+
         """
 
-        for proxy in proxies:
-            self._http.proxy_container.proxies.append(proxy)
+        # If attempting to stop a download when none is occurring
+        if self._download is None:
+            raise NotDownloadingStream("Not currently downloading the stream!")
 
-    async def remove_proxies(self, *proxies: str) -> None:
+        # If attempting to stop a download before the process has opened
+        if self._download.ffmpeg.process is None:
+            raise DownloadProcessNotFound("Download process not found. You are likely stopping the download before the ffmpeg process has opened. Add a delay!")
+
+        # Kill the process
+        os.kill(self._download.ffmpeg.process.pid, signal.CTRL_BREAK_EVENT)
+
+        # Give info about the final product
+        if self._download.verbose:
+            logging.warning(
+                f"Stopped the download to path \"{self._download.path}\" on user @{self.unique_id} after "
+                f"\"{int(datetime.utcnow().timestamp()) - self._download.started_at} seconds\" of downloading"
+            )
+
+    async def set_proxies(self, proxies: Optional[Dict[str, str]]) -> None:
         """
-        Remove proxies from the proxy container for request usage
+        Set the proxies to be used by the HTTP client (Not Websockets)
 
-        :param proxies: Proxies to remove
-        :raises ValueError: Raises ValueError if proxy is not present
+        :param proxies: The proxies to use in HTTP requests
         :return: None
 
         """
 
-        for proxy in proxies:
-            self._http.proxy_container.proxies.remove(proxy)
+        self._http.proxies = proxies
 
-    async def get_proxies(self) -> List[str]:
+    @property
+    async def proxies(self) -> Optional[Dict[str, str]]:
         """
-        Get a list of the current proxies in the proxy container being used for requests
+        Get the current proxies being used in HTTP requests
 
-        :return: The proxies in the request container
+        :return: The current proxies in use
+
         """
 
-        return self._http.proxy_container.proxies
+        return self._http.proxies
 
     @property
     def viewer_count(self) -> Optional[int]:
